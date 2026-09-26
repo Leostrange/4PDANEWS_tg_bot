@@ -61,7 +61,7 @@ sessions: dict[int, dict] = {}
 
 
 def save_sessions() -> None:
-    """Save sessions atomically; mount /data on Railway for durable storage."""
+    """Сохранить сессии атомарно; для постоянного хранения подключить том."""
     path = Path(Config.DATA_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
