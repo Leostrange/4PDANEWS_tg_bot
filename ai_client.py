@@ -18,10 +18,10 @@ logger = logging.getLogger(__name__)
 class AIClient:
     """Асинхронный клиент для OpenAI-совместимого /chat/completions API."""
 
-    def __init__(self):
-        self.base_url = Config.API_BASE_URL.rstrip("/")
-        self.api_key = Config.API_KEY
-        self.model = Config.MODEL
+    def __init__(self, base_url: str, api_key: str, model: str):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

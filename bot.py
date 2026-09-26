@@ -17,6 +17,7 @@ import html
 import json
 import logging
 import os
+from urllib.parse import urlsplit
 from pathlib import Path
 from datetime import datetime
 
@@ -52,7 +53,7 @@ def allowed_user(message: Message) -> bool:
 
 router.message.filter(allowed_user)
 
-ai = AIClient()
+provider_setup: dict[int, dict] = {}
 
 # ── Хранилище сессий (per-user) ──
 # Ключ: user_id (int)
@@ -65,7 +66,10 @@ def save_sessions() -> None:
     path = Path(Config.DATA_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(sessions, ensure_ascii=False), encoding="utf-8")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(temporary, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        json.dump(sessions, file, ensure_ascii=False)
     os.replace(temporary, path)
 
 
@@ -77,6 +81,7 @@ def load_sessions() -> None:
             sessions.update({int(key): value for key, value in data.items()})
             for session in sessions.values():
                 session["processing"] = False
+                session.setdefault("provider", None)
             logger.info("Восстановлено сессий: %s", len(sessions))
         except (OSError, ValueError, TypeError) as exc:
             logger.error("Не удалось загрузить сессии: %s", exc)
@@ -91,6 +96,7 @@ def get_session(user_id: int) -> dict:
             "processing": False,   # Идёт ли сейчас генерация
             "mode": "manual",      # manual / auto
             "summary_counter": 0,  # Счётчик сводок (для номера #NNN)
+            "provider": None,       # Адрес, модель и ключ AI для пользователя
         }
     return sessions[user_id]
 
@@ -123,6 +129,29 @@ def _default_prompt() -> str:
 7. Ссылки сохраняй оригинальными"""
 
 
+def get_ai_client(user_id: int) -> AIClient | None:
+    provider = get_session(user_id).get("provider")
+    if not provider:
+        return None
+    return AIClient(provider["base_url"], provider["api_key"], provider["model"])
+
+
+def valid_api_url(value: str) -> bool:
+    if len(value) > 2048:
+        return False
+    try:
+        parsed = urlsplit(value)
+        parsed.port  # Некорректный порт вызывает ValueError.
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https" and bool(parsed.hostname) and
+        not parsed.username and not parsed.password and
+        not parsed.query and not parsed.fragment and
+        not value.rstrip("/").endswith("/chat/completions")
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 #  КОМАНДЫ
 # ═══════════════════════════════════════════════════════════════
@@ -136,8 +165,9 @@ async def cmd_start(message: Message):
         "📋 <b>Как пользоваться:</b>\n"
         "1. Нажми /new — начать новую сессию\n"
         "2. Пересылай посты из сохранённой папки\n"
-        "3. Когда все посты собраны — жми /gen\n"
-        "4. Получи готовую сводку!\n\n"
+        "3. Настрой AI через /provider\n"
+        "4. Когда все посты собраны — жми /gen\n"
+        "5. Получи готовую сводку!\n\n"
         "⚙️ <b>Команды:</b>\n"
         "/new — новая сессия (очистить старые посты)\n"
         "/gen — создать сводку из собранных постов\n"
@@ -146,6 +176,9 @@ async def cmd_start(message: Message):
         "/export — экспортировать последнюю сводку в файл\n"
         "/clear — очистить сессию\n"
         "/test — проверить подключение к AI\n"
+        "/provider — указать адрес API, ключ и модель\n"
+        "/provider_status — показать настройки без ключа\n"
+        "/provider_clear — удалить настройки AI\n"
         "/help — эта справка"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
@@ -155,6 +188,85 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     """Справка (дублирует /start)."""
     await cmd_start(message)
+
+
+@router.message(Command("provider"))
+async def cmd_provider(message: Message):
+    """Начать настройку провайдера только в личном чате."""
+    if message.chat.type != "private":
+        await message.answer("⚠️ Настраивай ключ только в личном чате с ботом.")
+        return
+    provider_setup[message.from_user.id] = {"step": "url"}
+    await message.answer(
+        "🔧 Отправь базовый HTTPS-адрес OpenAI-совместимого API "
+        "(например https://api.openai.com/v1).\n"
+        "Для отмены: /provider_cancel"
+    )
+
+
+@router.message(Command("provider_cancel"))
+async def cmd_provider_cancel(message: Message):
+    provider_setup.pop(message.from_user.id, None)
+    await message.answer("Настройка отменена. Прежний провайдер сохранён.")
+
+
+@router.message(Command("provider_status"))
+async def cmd_provider_status(message: Message):
+    provider = get_session(message.from_user.id).get("provider")
+    if not provider:
+        await message.answer("AI-провайдер пока не настроен. Нажми /provider.")
+        return
+    await message.answer(
+        f"🔧 API: <code>{html.escape(provider['base_url'])}</code>\n"
+        f"Модель: <code>{html.escape(provider['model'])}</code>\n"
+        "Ключ: сохранён (не показывается)", parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("provider_clear"))
+async def cmd_provider_clear(message: Message):
+    if get_session(message.from_user.id)["processing"]:
+        await message.answer("⏳ Дождись окончания генерации.")
+        return
+    provider_setup.pop(message.from_user.id, None)
+    get_session(message.from_user.id)["provider"] = None
+    save_sessions()
+    await message.answer("🗑 Настройки AI и ключ удалены.")
+
+
+async def handle_provider_setup(message: Message, value: str) -> None:
+    state = provider_setup[message.from_user.id]
+    if message.chat.type != "private":
+        await message.answer("⚠️ Продолжи настройку в личном чате с ботом.")
+        return
+    if state["step"] == "url":
+        if not valid_api_url(value):
+            await message.answer("Нужен базовый HTTPS-адрес без /chat/completions. Попробуй снова.")
+            return
+        state.update(step="key", base_url=value.rstrip("/"))
+        await message.answer("Отправь API-ключ отдельным сообщением. Я удалю сообщение с ключом после получения.")
+    elif state["step"] == "key":
+        try:
+            await message.delete()
+        except Exception:
+            logger.warning("Не удалось удалить сообщение с API-ключом")
+            await message.answer("⚠️ Не удалось удалить сообщение с ключом; удали его вручную в Telegram.")
+        if not value or len(value) > 2048:
+            await message.answer("Ключ пустой или слишком длинный. Отправь корректный ключ.")
+            return
+        state.update(step="model", api_key=value)
+        await message.answer("Отправь ID модели, доступной у твоего провайдера.")
+    else:
+        if not value or len(value) > 200:
+            await message.answer("ID модели пустой или слишком длинный. Попробуй снова.")
+            return
+        session = get_session(message.from_user.id)
+        session["provider"] = {
+            "base_url": state["base_url"], "api_key": state["api_key"], "model": value
+        }
+        provider_setup.pop(message.from_user.id, None)
+        save_sessions()
+        await message.answer("✅ Провайдер сохранён. Проверь /test, затем отправь посты и нажми /gen.")
 
 
 @router.message(Command("new"))
@@ -180,14 +292,15 @@ async def cmd_new(message: Message):
 
 @router.message(Command("clear"))
 async def cmd_clear(message: Message):
-    """Полная очистка сессии (включая счётчик)."""
+    """Полная очистка сессии, включая настройки провайдера."""
     if get_session(message.from_user.id)["processing"]:
         await message.answer("⏳ Дождись окончания генерации перед очисткой.")
         return
     sessions.pop(message.from_user.id, None)
+    provider_setup.pop(message.from_user.id, None)
     save_sessions()
     await message.answer(
-        "🗑 Сессия полностью очищена (включая счётчик сводок).\n"
+        "🗑 Сессия, счётчик и настройки AI очищены.\n"
         "Начни заново с /new",
     )
 
@@ -249,21 +362,25 @@ async def cmd_prompt(message: Message):
 @router.message(Command("test"))
 async def cmd_test(message: Message):
     """Проверить подключение к AI."""
+    client = get_ai_client(message.from_user.id)
+    if client is None:
+        await message.answer("Сначала настрой AI-провайдера через /provider.")
+        return
     msg = await message.answer("🔍 Проверяю подключение к AI...")
-    ok = await ai.test_connection()
+    ok = await client.test_connection()
     if ok:
         await msg.edit_text(
             f"✅ <b>Подключение работает!</b>\n"
-            f"Модель: <code>{html.escape(Config.MODEL)}</code>\n"
-            f"Base URL: <code>{html.escape(Config.API_BASE_URL)}</code>",
+            f"Модель: <code>{html.escape(client.model)}</code>\n"
+            f"Base URL: <code>{html.escape(client.base_url)}</code>",
             parse_mode=ParseMode.HTML,
         )
     else:
         await msg.edit_text(
             "❌ <b>Не удалось подключиться к AI</b>\n\n"
             "Проверь:\n"
-            "• API_BASE_URL — правильный адрес?\n"
-            "• API_KEY — валидный ключ?\n"
+            "• Адрес API в /provider — правильный?\n"
+            "• Ключ от провайдера действителен?\n"
             "• Сеть — есть ли доступ к провайдеру?",
             parse_mode=ParseMode.HTML,
         )
@@ -276,6 +393,11 @@ async def cmd_gen(message: Message):
     Берёт все посты из текущей сессии → отправляет в ИИ → возвращает сводку.
     """
     s = get_session(message.from_user.id)
+
+    client = get_ai_client(message.from_user.id)
+    if client is None:
+        await message.answer("Сначала настрой AI-провайдера через /provider.")
+        return
 
     if not s["posts"]:
         await message.answer(
@@ -324,7 +446,7 @@ async def cmd_gen(message: Message):
         ]
 
         # ── Запрос к AI ──
-        result = await ai.generate(messages)
+        result = await client.generate(messages)
 
         if not result or not result.strip():
             raise Exception("AI вернул пустой ответ")
@@ -394,6 +516,9 @@ async def cmd_export(message: Message):
 @router.message(F.forward_origin)
 async def handle_forwarded(message: Message):
     """Ловит пересланные посты и добавляет в сессию."""
+    if message.from_user.id in provider_setup:
+        await message.answer("Заверши настройку /provider или отмени её через /provider_cancel.")
+        return
     s = get_session(message.from_user.id)
 
     # Лимиты
@@ -441,6 +566,10 @@ async def handle_text(message: Message):
 
     # Игнорируем команды
     if text.startswith("/"):
+        return
+
+    if message.from_user.id in provider_setup:
+        await handle_provider_setup(message, text.strip())
         return
 
     s = get_session(message.from_user.id)
@@ -611,13 +740,6 @@ async def main():
     global bot
     bot = Bot(token=Config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     load_sessions()
-
-    # Проверка подключения к AI
-    logger.info("Проверяю подключение к AI-провайдеру...")
-    if await ai.test_connection():
-        logger.info("✅ AI-провайдер доступен")
-    else:
-        logger.warning("⚠️ Не удалось проверить AI-провайдер, но бот запускается")
 
     # Загрузка промпта
     load_prompt()
