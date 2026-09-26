@@ -18,6 +18,10 @@ class Config:
 
     # ── Telegram ──
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    ALLOWED_USER_IDS: set[int] = {
+        int(value.strip()) for value in os.getenv("ALLOWED_USER_IDS", "").split(",")
+        if value.strip()
+    }
 
     # ── AI-провайдер (OpenAI-совместимый API) ──
     API_BASE_URL: str = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
@@ -31,7 +35,8 @@ class Config:
 
     # ── Лимиты ──
     MAX_POSTS: int = int(os.getenv("MAX_POSTS", "100"))
-    MAX_CHARS: int = int(os.getenv("MAX_CHARS", "500000"))
+    MAX_CHARS: int = int(os.getenv("MAX_CHARS", "60000"))
+    DATA_FILE: str = os.getenv("DATA_FILE", "data/sessions.json")
 
     @classmethod
     def validate(cls) -> list[str]:
@@ -41,6 +46,8 @@ class Config:
             errors.append("BOT_TOKEN не задан")
         if not cls.API_KEY:
             errors.append("API_KEY не задан (ключ от AI-провайдера)")
+        if cls.MAX_POSTS <= 0 or cls.MAX_CHARS <= 0:
+            errors.append("MAX_POSTS и MAX_CHARS должны быть положительными")
         return errors
 
     @classmethod

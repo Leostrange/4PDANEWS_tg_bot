@@ -13,14 +13,18 @@ Telegram-бот для анализа постов и создания свод�
 """
 
 import asyncio
+import html
+import json
 import logging
 import os
+from pathlib import Path
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, BufferedInputFile
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 from config import Config
 from ai_client import AIClient
@@ -34,10 +38,19 @@ logging.basicConfig(
 logger = logging.getLogger("bot")
 
 # ── Инициализация ──
-bot = Bot(token=Config.BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = None
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+
+def allowed_user(message: Message) -> bool:
+    return bool(message.from_user) and (
+        not Config.ALLOWED_USER_IDS or message.from_user.id in Config.ALLOWED_USER_IDS
+    )
+
+
+router.message.filter(allowed_user)
 
 ai = AIClient()
 
@@ -45,6 +58,28 @@ ai = AIClient()
 # Ключ: user_id (int)
 # Значение: dict с полями posts, summaries, processing, mode
 sessions: dict[int, dict] = {}
+
+
+def save_sessions() -> None:
+    """Save sessions atomically; mount /data on Railway for durable storage."""
+    path = Path(Config.DATA_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(sessions, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def load_sessions() -> None:
+    path = Path(Config.DATA_FILE)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            sessions.update({int(key): value for key, value in data.items()})
+            for session in sessions.values():
+                session["processing"] = False
+            logger.info("Восстановлено сессий: %s", len(sessions))
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("Не удалось загрузить сессии: %s", exc)
 
 
 def get_session(user_id: int) -> dict:
@@ -126,9 +161,12 @@ async def cmd_help(message: Message):
 async def cmd_new(message: Message):
     """Начать новую сессию — очистить собранные посты (счётчик сохраняется)."""
     s = get_session(message.from_user.id)
+    if s["processing"]:
+        await message.answer("⏳ Дождись окончания генерации перед новой сессией.")
+        return
     s["posts"] = []
     s["summaries"] = []
-    s["processing"] = False
+    save_sessions()
     # Счётчик НЕ сбрасывается — номера сводок идут подряд
     next_num = s["summary_counter"] + 1
     await message.answer(
@@ -143,7 +181,11 @@ async def cmd_new(message: Message):
 @router.message(Command("clear"))
 async def cmd_clear(message: Message):
     """Полная очистка сессии (включая счётчик)."""
+    if get_session(message.from_user.id)["processing"]:
+        await message.answer("⏳ Дождись окончания генерации перед очисткой.")
+        return
     sessions.pop(message.from_user.id, None)
+    save_sessions()
     await message.answer(
         "🗑 Сессия полностью очищена (включая счётчик сводок).\n"
         "Начни заново с /new",
@@ -184,7 +226,7 @@ async def cmd_status(message: Message):
         f"📝 Постов собрано: <b>{len(posts)}</b>\n"
         f"  • Текстовых: {text_count}\n"
         f"  • С медиа: {media_count}\n"
-        f"📌 Источники: {sources_text}\n"
+        f"📌 Источники: {html.escape(sources_text)}\n"
         f"🔄 Статус: {status_emoji}\n"
         f"📚 Сводок создано: {len(summaries)}\n"
         f"🔢 Следующая сводка: <b>#{s['summary_counter'] + 1}</b>"
@@ -199,7 +241,7 @@ async def cmd_prompt(message: Message):
     preview = prompt[:2000] + ("..." if len(prompt) > 2000 else "")
     text = (
         f"📝 <b>Системный промпт</b> ({len(prompt)} символов):\n\n"
-        f"<code>{preview}</code>"
+        f"<code>{html.escape(preview)}</code>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
 
@@ -212,8 +254,8 @@ async def cmd_test(message: Message):
     if ok:
         await msg.edit_text(
             f"✅ <b>Подключение работает!</b>\n"
-            f"Модель: <code>{Config.MODEL}</code>\n"
-            f"Base URL: <code>{Config.API_BASE_URL}</code>",
+            f"Модель: <code>{html.escape(Config.MODEL)}</code>\n"
+            f"Base URL: <code>{html.escape(Config.API_BASE_URL)}</code>",
             parse_mode=ParseMode.HTML,
         )
     else:
@@ -251,8 +293,7 @@ async def cmd_gen(message: Message):
     post_count = len(s["posts"])
 
     # ── Автоинкремент номера сводки ──
-    s["summary_counter"] += 1
-    summary_number = s["summary_counter"]
+    summary_number = s["summary_counter"] + 1
 
     # ── Сообщение о прогрессе ──
     progress_msg = await message.answer(
@@ -290,10 +331,12 @@ async def cmd_gen(message: Message):
 
         # ── Сохраняем результат ──
         s["summaries"].append(result)
+        s["summary_counter"] = summary_number
+        save_sessions()
 
         # ── Отправляем сводку ──
         # Telegram лимит — 4096 символов, разбиваем если нужно
-        await _send_long_message(message, result, parse_mode=ParseMode.HTML)
+        await _send_long_message(message, result)
 
         # ── Уведомление о следующих шагах ──
         next_num = s["summary_counter"] + 1
@@ -311,7 +354,7 @@ async def cmd_gen(message: Message):
     except Exception as e:
         logger.error(f"Ошибка генерации: {e}", exc_info=True)
         await message.answer(
-            f"❌ <b>Ошибка при генерации:</b>\n\n<code>{str(e)[:500]}</code>",
+            f"❌ <b>Ошибка при генерации:</b>\n\n<code>{html.escape(str(e)[:500])}</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -336,19 +379,11 @@ async def cmd_export(message: Message):
 
     last_summary = s["summaries"][-1]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"summary_{timestamp}.md"
-
-    # Сохраняем во временный файл
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(last_summary)
-
+    filename = f"summary_{timestamp}.txt"
     await message.answer_document(
-        FSInputFile(filename),
+        BufferedInputFile(last_summary.encode("utf-8"), filename=filename),
         caption=f"📄 Сводка ({len(last_summary)} символов)",
     )
-
-    # Удаляем временный файл
-    os.remove(filename)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -370,7 +405,11 @@ async def handle_forwarded(message: Message):
         return
 
     total_chars = sum(len(p.get("text", "")) for p in s["posts"])
-    if total_chars >= Config.MAX_CHARS:
+    post_data = _extract_post(message)
+    if not post_data["text"].strip():
+        await message.answer("⚠️ В пересланном сообщении нет текста или подписи для анализа.")
+        return
+    if total_chars + len(post_data["text"]) > Config.MAX_CHARS:
         await message.answer(
             f"⚠️ Достигнут лимит символов ({Config.MAX_CHARS:,}).\n"
             "Жми /gen для создания сводки."
@@ -378,14 +417,14 @@ async def handle_forwarded(message: Message):
         return
 
     # Извлекаем данные из сообщения
-    post_data = _extract_post(message)
     s["posts"].append(post_data)
+    save_sessions()
 
     count = len(s["posts"])
     await message.answer(
         f"✅ Пост #{count} принят!\n"
         f"📝 Текст: {len(post_data.get('text', ''))} символов\n"
-        f"📌 Источник: {post_data.get('source', '—')}",
+        f"📌 Источник: {html.escape(post_data.get('source', '—'))}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -409,6 +448,9 @@ async def handle_text(message: Message):
     if len(s["posts"]) >= Config.MAX_POSTS:
         await message.answer(f"⚠️ Лимит {Config.MAX_POSTS} постов.")
         return
+    if sum(len(p.get("text", "")) for p in s["posts"]) + len(text) > Config.MAX_CHARS:
+        await message.answer(f"⚠️ Превышен лимит {Config.MAX_CHARS:,} символов.")
+        return
 
     post_data = {
         "text": text,
@@ -417,6 +459,7 @@ async def handle_text(message: Message):
         "media_type": "text",
     }
     s["posts"].append(post_data)
+    save_sessions()
 
     count = len(s["posts"])
     await message.answer(
@@ -439,12 +482,14 @@ def _extract_post(message: Message) -> dict:
     origin = message.forward_origin
     if origin:
         # aiogram 3.x: forward_origin может быть разных типов
-        if hasattr(origin, "sender_chat_name"):
-            source = origin.sender_chat_name or source
-        elif hasattr(origin, "chat_name"):
-            source = origin.chat_name or source
-        elif hasattr(origin, "sender_user_full_name"):
-            source = origin.sender_user_full_name or source
+        if getattr(origin, "chat", None):
+            source = origin.chat.title or source
+        elif getattr(origin, "sender_user", None):
+            source = origin.sender_user.full_name or source
+        elif getattr(origin, "sender_user_name", None):
+            source = origin.sender_user_name
+        elif getattr(origin, "sender_chat_name", None):
+            source = origin.sender_chat_name
 
         # Fallback: channel_post / forwarded_from
         if source == "неизвестный канал":
@@ -471,8 +516,8 @@ def _extract_post(message: Message) -> dict:
 
     # ── Дата ──
     date_str = ""
-    if message.forward_date:
-        date_str = message.forward_date.isoformat()
+    if getattr(origin, "date", None):
+        date_str = origin.date.isoformat()
     elif message.date:
         date_str = message.date.isoformat()
 
@@ -509,38 +554,39 @@ def _format_posts_for_ai(posts: list[dict]) -> str:
     return "\n".join(parts)
 
 
-async def _send_long_message(message: Message, text: str, parse_mode=None):
+async def _send_long_message(message: Message, text: str):
     """
-    Отправляет длинное сообщение, разбивая на части по 4096 символов.
-    Умно разбивает по границам абзацев.
+    Отправляет длинное сообщение частями с запасом под UTF-16-символы Telegram.
     """
-    MAX_LEN = 4096
+    MAX_LEN = 2000  # каждый символ Python занимает не более двух UTF-16 единиц
 
+    # The model returns 4PDA BBCode. Telegram HTML parsing would reject it.
     if len(text) <= MAX_LEN:
-        await message.answer(text, parse_mode=parse_mode)
+        await message.answer(text, parse_mode=None)
         return
 
-    # Разбиваем по строкам, собирая блоки
+    # Разбиваем по строкам, включая строки длиннее одного сообщения.
     chunks = []
     current = ""
 
-    for line in text.split("\n"):
-        # Если добавление строки не превысит лимит
-        if len(current) + len(line) + 1 <= MAX_LEN:
-            current += line + "\n"
-        else:
-            if current.strip():
-                chunks.append(current.rstrip())
-            current = line + "\n"
+    for line in text.splitlines(keepends=True):
+        while line:
+            space = MAX_LEN - len(current)
+            if space == 0:
+                chunks.append(current)
+                current = ""
+                space = MAX_LEN
+            current += line[:space]
+            line = line[space:]
 
-    if current.strip():
-        chunks.append(current.rstrip())
+    if current:
+        chunks.append(current)
 
     # Отправляем каждую часть
     for i, chunk in enumerate(chunks):
         if i > 0:
             await asyncio.sleep(0.5)  # Задержка чтобы Telegram не блокировал
-        await message.answer(chunk, parse_mode=parse_mode)
+        await message.answer(chunk, parse_mode=None)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -550,8 +596,6 @@ async def _send_long_message(message: Message, text: str, parse_mode=None):
 
 async def main():
     """Точка входа: проверка конфигурации и запуск polling."""
-    Config.print_config()
-
     # Проверка конфигурации
     errors = Config.validate()
     if errors:
@@ -562,7 +606,11 @@ async def main():
             "\nСоздай файл .env или задай переменные окружения.\n"
             "Смотри README.md для инструкций."
         )
-        return
+        raise SystemExit(1)
+
+    global bot
+    bot = Bot(token=Config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    load_sessions()
 
     # Проверка подключения к AI
     logger.info("Проверяю подключение к AI-провайдеру...")
@@ -576,7 +624,10 @@ async def main():
 
     # Запуск бота
     logger.info("🤖 Бот запущен! Ожидаю сообщения...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":

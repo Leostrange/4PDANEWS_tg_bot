@@ -58,10 +58,7 @@ class AIClient:
                     timeout=aiohttp.ClientTimeout(total=300),  # 5 минут на ответ
                 ) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
-                        raise Exception(
-                            f"API вернул статус {resp.status}:\n{error_text[:500]}"
-                        )
+                        raise RuntimeError(f"AI API вернул HTTP {resp.status}; проверь настройки провайдера и его логи")
 
                     data = await resp.json()
                     content = data["choices"][0]["message"]["content"]
@@ -100,10 +97,7 @@ class AIClient:
                     timeout=aiohttp.ClientTimeout(total=300),
                 ) as resp:
                     if resp.status != 200:
-                        error_text = await resp.text()
-                        raise Exception(
-                            f"API вернул статус {resp.status}:\n{error_text[:500]}"
-                        )
+                        raise RuntimeError(f"AI API вернул HTTP {resp.status}; проверь настройки провайдера и его логи")
 
                     async for line in resp.content:
                         line = line.decode("utf-8").strip()
@@ -139,12 +133,8 @@ class AIClient:
                         logger.info(f"Доступные модели: {models[:10]}")
                         return True
                     else:
-                        # Некоторые провайдеры не поддерживают /models
-                        logger.warning(
-                            f"/models вернул {resp.status}, "
-                            "но это нормально для некоторых провайдеров"
-                        )
-                        return True
+                        logger.warning("Проверка /models вернула HTTP %s", resp.status)
+                        return False
         except Exception as e:
             logger.error(f"Ошибка подключения к API: {e}")
             return False
